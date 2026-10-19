@@ -7,6 +7,7 @@ import os
 import sys
 import select
 import json
+import psycopg2
 
 
 # ============================================================================
@@ -85,6 +86,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description='PLC Thermal Cycle Controller (direct-analog setpoint)')
     parser.add_argument('-c', '--config', default='Control_HMI.yml', help='Path to the YAML config file')
     parser.add_argument('-f', '--force-run', action='store_true', help='Override safety mode checks')
+    parser.add_argument('-b', '--batch', default=None,
+                         help="batch_name of the existing mmts_batch_logging row for this run "
+                              "(the same batch_name the MMTS GUI already logged). If given, this "
+                              "script UPDATEs that row's cycle_count as real low points are hit. "
+                              "If omitted, cycle counts are not written to the database.")
     return parser.parse_args()
 
 
@@ -112,7 +118,8 @@ def get_filtered_sensor_data(client, db_number):
     and returns a list of valid temperatures along with their computed average.
     """
     # Offsets directly from the PDF compilation sheet
-    pt_offsets = [44, 82, 120, 158, 196, 234, 272]  # Extended up to your array block
+    # pt_offsets = [44, 82, 120, 158, 196, 234, 272]  # Extended up to your array block
+    pt_offsets = [82, 120, 158, 196, 234]
 
     valid_temps = []
     for idx, offset in enumerate(pt_offsets, 1):
@@ -156,8 +163,8 @@ DEWPOINT_OFFSETS = (314, 356)   # DB15 REALs, the two dew-point sensors
 #  2) RUNTIME SAFEGUARD -- the COLDEST measured surface must stay at least
 #     CONDENSATION_MARGIN above the current dew point at ALL times, or the run STOPS.
 #     Checked continuously on ACTUAL temperature -- this is the dry-air-failure safety net.
-START_DEWPOINT_MAX = -35.0      # (1) start gate: refuse to begin cooling if dew point > this
-CONDENSATION_MARGIN = 5.0       # (2) runtime: stop if coldest sensor < dewpoint + margin
+START_DEWPOINT_MAX = -38.0      # (1) start gate: refuse to begin cooling if dew point > this
+CONDENSATION_MARGIN = 10.0      # (2) runtime: stop if coldest sensor < dewpoint + margin
 DEWPOINT_VALID_MAX = 30.0       # readings above this are non-physical -> faulty channel
 DEWPOINT_VALID_MIN = -100.0     # below this = faulty/unscaled channel
 DOOR_LOCK_M = (60, 0)           # %M60.0 = door locked (the bit system_status() gates on)
@@ -284,10 +291,11 @@ CHECKPOINT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 PHASE_NAMES = ['cooling', 'warming']   # phase index 0 = cold phase, 1 = warm phase
 
 
-def save_checkpoint(cycle, phase, total_cycles):
+def save_checkpoint(cycle, phase, total_cycles, batch_name, completed_cycles):
     try:
         with open(CHECKPOINT_FILE, 'w') as f:
             json.dump({'cycle': cycle, 'phase': phase, 'total_cycles': total_cycles,
+                       'batch_name': batch_name, 'completed_cycles': completed_cycles,
                        'time': time.strftime('%Y-%m-%d %H:%M:%S')}, f)
     except Exception as e:
         print(f"  [WARN] could not write checkpoint: {e}")
@@ -310,8 +318,55 @@ def clear_checkpoint():
         print(f"  [WARN] could not clear checkpoint: {e}")
 
 
+# ============================================================================
+#  THERMAL CYCLE COUNT -> mmts_batch_logging (hgcdb)
+#  This does NOT create a new row. It REPLACES the cycle_count on the EXISTING
+#  row the MMTS GUI already logged for this batch (identified by --batch) with
+#  the REAL number of completed cold-phase low points, since that column was
+#  previously populated with an unrelated/incorrect value.
+#  DB errors are non-fatal -- a flaky DB link must never abort a physical run.
+# ============================================================================
+
+
+def db_connect(db_cfg):
+    try:
+        return psycopg2.connect(host=db_cfg['DB_HOST'], port=db_cfg['DB_PORT'],
+                                 user=db_cfg['DB_USER'], password=db_cfg['DB_PASSWORD'],
+                                 dbname=db_cfg['DB_NAME'])
+    except Exception as e:
+        print(f"  [WARN] could not connect to database: {e}")
+        return None
+
+
+def update_cycle_count(db_cfg, batch_name, completed_cycles):
+    """Replace cycle_count on the EXISTING mmts_batch_logging row for batch_name."""
+    conn = db_connect(db_cfg)
+    if conn is None:
+        return
+    try:
+        with conn, conn.cursor() as cur:
+            # Every row of this batch gets the count (the GUI logs several rows per
+            # batch and some are cleaned up later) -- whichever row survives keeps it.
+            cur.execute("UPDATE mmts_batch_logging SET cycle_count = %s WHERE batch_name = %s",
+                        (completed_cycles, batch_name))
+            if cur.rowcount == 0:
+                print(f"  [WARN] no mmts_batch_logging row found for batch_name="
+                      f"'{batch_name}' -- cycle_count was NOT recorded")
+            else:
+                print(f"  [DB] batch '{batch_name}': cycle_count = {completed_cycles} "
+                      f"written to {cur.rowcount} row(s)")
+    except Exception as e:
+        print(f"  [WARN] could not update cycle count: {e}")
+    finally:
+        conn.close()
+
+
 def do_cold_phase(client, db_num, exp_cfg, cycle):
-    """PHASE 1: overdrive cold -> settle to hold -> IV pause (cycle 1) / cold soak."""
+    """
+    PHASE 1: overdrive cold -> settle to hold -> IV pause (cycle 1) / cold soak.
+    Returns True if the cold target was genuinely reached (a real thermal-cycle low
+    point), or False if the phase was instead forced to advance by the stall timeout.
+    """
     print(f"\n[PHASE 1] Cooling fast (drive {COLD_DRIVE_SETPOINT}°C), "
           f"will settle to {COLD_HOLD_SETPOINT}°C once cold")
     enforce_safety(client, db_num, target=COLD_DRIVE_SETPOINT)  # START GATE: dew point <= -35
@@ -321,6 +376,7 @@ def do_cold_phase(client, db_num, exp_cfg, cycle):
           f"(warmest <= {COLD_DONE_MAX:+.1f}°C, lowest-3 avg <= {COLD_DONE_AVG:+.1f}°C)...")
     stall_counter = 0
     last_avg_temp = 999.0
+    target_reached = False
     while True:
         valid_temps, current_avg = get_filtered_sensor_data(client, db_num)
         max_sensor_temp = max(valid_temps)
@@ -334,6 +390,7 @@ def do_cold_phase(client, db_num, exp_cfg, cycle):
         if (lowest3 <= COLD_DONE_AVG) and (max_sensor_temp <= COLD_DONE_MAX):
             print(f"\n[TARGET ACHIEVED] warmest sensor <= {COLD_DONE_MAX:+.1f}°C and "
                   f"lowest-3 avg <= {COLD_DONE_AVG:+.1f}°C")
+            target_reached = True
             break
         
         if abs(last_avg_temp - current_avg) < 0.10:
@@ -343,7 +400,6 @@ def do_cold_phase(client, db_num, exp_cfg, cycle):
             stall_counter = 0
             print('Stall = 0')
             
-        print(' Before stall') 
         if stall_counter >= 90:  # 90 * 20s = 30 min stall threshold
             print(f"\n[STALL ALERT] System leveled out at {current_avg:.2f}°C. Advancing...")
             break
@@ -354,12 +410,14 @@ def do_cold_phase(client, db_num, exp_cfg, cycle):
     print(f"--> Cold target reached. Settling chiller to hold {COLD_HOLD_SETPOINT}°C...")
     set_analog_setpoint(client, COLD_HOLD_SETPOINT)
 
-    if cycle == 1:
+    if (cycle == 1 or cycle == exp_cfg['cycles']):
         cold_valid, _ = get_filtered_sensor_data(client, db_num)
         wait_for_iv_continue(client, db_num, min(cold_valid))
     else:
         print(f"--> Starting cold soak timer for {exp_cfg['idle_cold_min']} minutes...")
         monitored_sleep(client, db_num, exp_cfg['idle_cold_min'] * 60)
+
+    return target_reached
 
 
 def do_warm_phase(client, db_num, exp_cfg):
@@ -409,6 +467,7 @@ def main():
 
     plc_cfg = cfg['plc']
     exp_cfg = cfg['experiment']
+    db_cfg = cfg['database']
     db_num = plc_cfg['db_number']
     total_cycles = exp_cfg['cycles']
 
@@ -419,6 +478,7 @@ def main():
 
     # --- Resume from an interrupted run? ---
     start_cycle, start_phase = 1, 0
+    batch_name, completed_cycles = None, 0
     ckpt = load_checkpoint()
     if ckpt:
         ck_cycle = ckpt.get('cycle', 1)
@@ -431,10 +491,24 @@ def main():
         ans = input("  Resume previous thermal cycle? [y/n]: ").strip().lower()
         if ans in ('y', 'yes'):
             start_cycle, start_phase, total_cycles = ck_cycle, ck_phase, ck_total
+            batch_name = ckpt.get('batch_name')
+            completed_cycles = ckpt.get('completed_cycles', 0)
             print(f"  Resuming at cycle {start_cycle}, '{PHASE_NAMES[start_phase]}' phase.\n")
         else:
             print("  Starting a fresh run from cycle 1.\n")
             clear_checkpoint()
+
+    # A fresh run (no resume, or resume declined) links to the batch_name the
+    # MMTS GUI already logged for this job, if one was given via --batch.
+    if batch_name is None:
+        batch_name = args.batch
+        completed_cycles = 0
+
+    if batch_name:
+        print(f"  [DB] cycle_count will replace the existing value on "
+              f"mmts_batch_logging batch_name='{batch_name}'")
+    else:
+        print("  [DB] no --batch given -- cycle counts will NOT be written to the database")
 
     try:
         print(
@@ -449,9 +523,15 @@ def main():
             # Resume only skips earlier phases of the FIRST resumed cycle.
             begin_phase = start_phase if cycle == start_cycle else 0
             for phase in range(begin_phase, len(PHASE_NAMES)):
-                save_checkpoint(cycle, phase, total_cycles)
+                save_checkpoint(cycle, phase, total_cycles, batch_name, completed_cycles)
                 if phase == 0:
-                    do_cold_phase(client, db_num, exp_cfg, cycle)
+                    if do_cold_phase(client, db_num, exp_cfg, cycle):
+                        completed_cycles += 1
+                        print(f"  [THERMAL CYCLE] Low point reached -- "
+                              f"completed cycles so far: {completed_cycles}")
+                        if batch_name:
+                            update_cycle_count(db_cfg, batch_name, completed_cycles)
+                        save_checkpoint(cycle, phase, total_cycles, batch_name, completed_cycles)
                 else:
                     do_warm_phase(client, db_num, exp_cfg)
 
