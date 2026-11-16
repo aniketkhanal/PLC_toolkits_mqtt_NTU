@@ -8,6 +8,8 @@ import sys
 import select
 import json
 import psycopg2
+import subprocess
+import requests
 
 
 # ============================================================================
@@ -91,6 +93,9 @@ def parse_args():
                               "(the same batch_name the MMTS GUI already logged). If given, this "
                               "script UPDATEs that row's cycle_count as real low points are hit. "
                               "If omitted, cycle counts are not written to the database.")
+    parser.add_argument('--mmts-gui-path', default=None, help='Path to MultiModuleTeststandUI, needed to trigger IV scans automatically')
+    parser.add_argument('--mmts-gui-port', type=int, default=5001, help='Port the Flask GUI is listening on.')
+    parser.add_argument('--auto-iv', action='store_true', help='Trigger IV scans automatically instead of waiting or typed "continue".')
     return parser.parse_args()
 
 
@@ -195,13 +200,15 @@ def measured_dewpoint(client, db_num):
 class SafetyAbort(Exception):
     """Raised when an interlock trips; the setpoint is driven safe first."""
 
+class CondensationRisk(Exception):
+    """Coldest sensor too close to the dew point; hold and retry."""
 
 def enforce_safety(client, db_num, target=None, min_actual_temp=None):
     """
     Software interlocks. On any violation, drive the setpoint back to ambient and
     raise SafetyAbort. Always checks door + chiller faults + dew-point validity, plus:
       - START GATE (pass target=...): refuse to begin cooling if dew point > START_DEWPOINT_MAX.
-      - RUNTIME SAFEGUARD (pass min_actual_temp=...): stop if the coldest measured surface
+      - RUNTIME SAFEGUARD (pass min_actual_temp=...): hold if the coldest measured surface
         is within CONDENSATION_MARGIN of the dew point (dry-air-failure protection).
     """
     # Collect EVERY tripped interlock so the abort message shows the full picture
@@ -216,6 +223,7 @@ def enforce_safety(client, db_num, target=None, min_actual_temp=None):
         reasons.append("CHILLER_CH_FAULT (DB.446.1)")
 
     # Dew-point checks only matter when a cold target / actual temp is in play.
+    condensation_reason = None
     if target is not None or min_actual_temp is not None:
         dp = measured_dewpoint(client, db_num)
         if dp is None:
@@ -225,7 +233,7 @@ def enforce_safety(client, db_num, target=None, min_actual_temp=None):
                 reasons.append(f"DEW POINT {dp:+.1f}°C is above the {START_DEWPOINT_MAX:+.1f}°C "
                                f"start requirement (box not dry enough to begin cooling)")
             if min_actual_temp is not None and min_actual_temp < dp + CONDENSATION_MARGIN:
-                reasons.append(f"CONDENSATION RISK: coldest sensor {min_actual_temp:+.1f}°C is "
+                condensation_reason = (f"CONDENSATION RISK: coldest sensor {min_actual_temp:+.1f}°C is "
                                f"within {CONDENSATION_MARGIN:.0f}°C of the dew point {dp:+.1f}°C")
 
     if reasons:
@@ -234,17 +242,61 @@ def enforce_safety(client, db_num, target=None, min_actual_temp=None):
         set_analog_setpoint(client, SAFE_AMBIENT)
         raise SafetyAbort("; ".join(reasons))
 
+    if condensation_reason:
+        print(f"\n [CONDENSATION HOLD] {condensation_reason}")
+        raise CondensationRisk(condensation_reason)
 
 def monitored_sleep(client, db_num, seconds):
     """time.sleep(seconds) but keeps the safety interlocks live (polls ~every 10s)."""
     waited = 0.0
     while waited < seconds:
         valid_temps, _ = get_filtered_sensor_data(client, db_num)
-        enforce_safety(client, db_num, min_actual_temp=min(valid_temps))
+        try:
+            enforce_safety(client, db_num, min_actual_temp=min(valid_temps))
+        except CondensationRisk as e:
+            print(f"\n  [CONDENSATION HOLD] {e} -- holding at {COLD_HOLD_SETPOINT}°C, soak timer paused")
+            set_analog_setpoint(client, COLD_HOLD_SETPOINT)
+            time.sleep(20)
+            continue
         step = min(10.0, seconds - waited)
         time.sleep(step)
         waited += step
 
+def fetch_module_ids_from_gui(port):
+    try:
+        resp = requests.get(f'http://127.0.0.1:{port}/api/get_config', timeout=5)
+        resp.raise_for_status()
+        return resp.json()  # {"1L": "<serial>", "1C": "<serial>", ...}
+    except requests.exceptions.RequestException as e:
+        print(f'[IV_SCAN] Could not reach MMTS GUI on port {port}: {e}')
+        return {}
+
+def run_automatic_iv_scan(mmts_gui_path, port, batch_name, iteration_label, target_temp):
+    if not batch_name:
+        print('[IV_SCAN] No --batch given; skipping automatic IV scan.')
+        return
+    mmts_gui_path = os.path.expanduser(mmts_gui_path)
+    module_ids = fetch_module_ids_from_gui(port)
+    if not module_ids:
+        print('[IV_SCAN] No modules configured in the GUI; skipping scan.')
+        return
+    module_args = ' '.join(f'{pos}={serial}' for pos, serial in module_ids.items())
+    cmd = (
+            f'cd "{mmts_gui_path}" && source init_bash_vars.sh && source .venv/bin/activate && '
+            f'make -f makefile_task3 run {module_args} '
+            f"batch='{batch_name}' iteration='{iteration_label}' currentTEMPERATURE='{target_temp}'"
+    )
+    print(f'[IV_SCAN] Starting automatic IV scan ({iteration_label})...')
+    subprocess.run(cmd, shell=True, executable='/bin/bash', check=False)
+    print('[IV_SCAN] IV scan finished, resuming thermal cycling.')
+
+def wait_for_iv_automatic(client, db_num, current_temp, mmts_gui_path, mmts_gui_port, batch_name, iteration_label):
+    """
+    Automatic counterpart to wait_for_iv_continue(): holts at the current setpoint, runs the IV scan against whatever 
+    modules are configured in the GUI, then resumes.
+    """
+    print(f">>> TAKE IV CURVE (coldest sensor: {current_temp:+.1f}°C) -- running automatically")
+    run_automatic_iv_scan(mmts_gui_path, mmts_gui_port, batch_name, iteration_label, current_temp)
 
 def wait_for_iv_continue(client, db_num, current_temp):
     """
@@ -259,7 +311,13 @@ def wait_for_iv_continue(client, db_num, current_temp):
     print("=" * 64)
     while True:
         valid_temps, _ = get_filtered_sensor_data(client, db_num)
-        enforce_safety(client, db_num, min_actual_temp=min(valid_temps))  # keep guarding during IV test
+        try:
+            enforce_safety(client, db_num, min_actual_temp=min(valid_temps))  # keep guarding during IV test
+        except CondensationRisk as e:
+            print(f"\n  [CONDENSATION HOLD] {e} -- holding at {COLD_HOLD_SETPOINT}°C")
+            set_analog_setpoint(client, COLD_HOLD_SETPOINT)
+            time.sleep(5.0)
+            continue
         # wait up to 5s for input without blocking the safety poll
         ready, _, _ = select.select([sys.stdin], [], [], 5.0)
         if ready:
@@ -361,7 +419,7 @@ def update_cycle_count(db_cfg, batch_name, completed_cycles):
         conn.close()
 
 
-def do_cold_phase(client, db_num, exp_cfg, cycle):
+def do_cold_phase(client, db_num, exp_cfg, cycle, auto_iv, mmts_gui_path, mmts_gui_port, batch_name):
     """
     PHASE 1: overdrive cold -> settle to hold -> IV pause (cycle 1) / cold soak.
     Returns True if the cold target was genuinely reached (a real thermal-cycle low
@@ -380,7 +438,13 @@ def do_cold_phase(client, db_num, exp_cfg, cycle):
     while True:
         valid_temps, current_avg = get_filtered_sensor_data(client, db_num)
         max_sensor_temp = max(valid_temps)
-        enforce_safety(client, db_num, min_actual_temp=min(valid_temps))  # condensation guard
+        try:
+            enforce_safety(client, db_num, min_actual_temp=min(valid_temps))  # condensation guard
+        except CondensationRisk as e:
+            print(f"\n  [CONDENSATION HOLD] {e} -- holding at {COLD_HOLD_SETPOINT}°C instead of driving colder")
+            set_analog_setpoint(client, COLD_HOLD_SETPOINT)
+            time.sleep(20)
+            continue
         lowest3_list = sorted(valid_temps)[:3]
         lowest3 = sum(lowest3_list) / len(lowest3_list)
 
@@ -412,7 +476,11 @@ def do_cold_phase(client, db_num, exp_cfg, cycle):
 
     if (cycle == 1 or cycle == exp_cfg['cycles']):
         cold_valid, _ = get_filtered_sensor_data(client, db_num)
-        wait_for_iv_continue(client, db_num, min(cold_valid))
+        if auto_iv:
+            iteration_label = 'iteration_2' if cycle == 1 else 'iteration_3'
+            wait_for_iv_automatic(client, db_num, min(cold_valid), mmts_gui_path, mmts_gui_port, batch_name, iteration_label)
+        else:
+            wait_for_iv_continue(client, db_num, min(cold_valid))
     else:
         print(f"--> Starting cold soak timer for {exp_cfg['idle_cold_min']} minutes...")
         monitored_sleep(client, db_num, exp_cfg['idle_cold_min'] * 60)
@@ -432,7 +500,12 @@ def do_warm_phase(client, db_num, exp_cfg):
     while True:
         valid_temps, current_avg = get_filtered_sensor_data(client, db_num)
         min_sensor_temp = min(valid_temps)
-        enforce_safety(client, db_num, min_actual_temp=min_sensor_temp)  # door / fault / condensation
+        try:
+            enforce_safety(client, db_num, min_actual_temp=min_sensor_temp)  # door / fault / condensation
+        except CondensationRisk as e:
+            print(f"\n  [CONDENSATION HOLD] {e} -- pausing warm-up")
+            time.sleep(20)
+            continue
 
         print(f"    [HEATING] Coldest Sensor: {min_sensor_temp:.2f}°C | "
               f"Group Avg: {current_avg:.2f}°C | Stall: {stall_counter}/45", end="\r")
@@ -479,6 +552,7 @@ def main():
     # --- Resume from an interrupted run? ---
     start_cycle, start_phase = 1, 0
     batch_name, completed_cycles = None, 0
+    is_fresh_start = True
     ckpt = load_checkpoint()
     if ckpt:
         ck_cycle = ckpt.get('cycle', 1)
@@ -493,6 +567,7 @@ def main():
             start_cycle, start_phase, total_cycles = ck_cycle, ck_phase, ck_total
             batch_name = ckpt.get('batch_name')
             completed_cycles = ckpt.get('completed_cycles', 0)
+            is_fresh_start = False
             print(f"  Resuming at cycle {start_cycle}, '{PHASE_NAMES[start_phase]}' phase.\n")
         else:
             print("  Starting a fresh run from cycle 1.\n")
@@ -511,6 +586,10 @@ def main():
         print("  [DB] no --batch given -- cycle counts will NOT be written to the database")
 
     try:
+        if args.auto_iv and is_fresh_start:
+            _, current_avg = get_filtered_sensor_data(client, db_num)
+            print("\n[IV_SCAN] Running initial room-temperature IV scan (iteration_1) before thermal cycling...")
+            run_automatic_iv_scan(args.mmts_gui_path, args.mmts_gui_port, batch_name, 'iteration_1', current_avg)
         print(
             f"\n[STARTING THERMAL CYCLING] Profiling {total_cycles} Cycles between "
             f"{WARM_SETPOINT}°C and {COLD_HOLD_SETPOINT}°C (cold drive {COLD_DRIVE_SETPOINT}°C)")
@@ -525,7 +604,7 @@ def main():
             for phase in range(begin_phase, len(PHASE_NAMES)):
                 save_checkpoint(cycle, phase, total_cycles, batch_name, completed_cycles)
                 if phase == 0:
-                    if do_cold_phase(client, db_num, exp_cfg, cycle):
+                    if do_cold_phase(client, db_num, exp_cfg, cycle, args.auto_iv, args.mmts_gui_path, args.mmts_gui_port, batch_name):
                         completed_cycles += 1
                         print(f"  [THERMAL CYCLE] Low point reached -- "
                               f"completed cycles so far: {completed_cycles}")
@@ -538,10 +617,18 @@ def main():
             print(f"[CYCLE COMPLETE] Cycle {cycle} of {total_cycles} finished successfully.")
 
         clear_checkpoint()   # whole run finished cleanly -> no resume next time
+
+        if args.auto_iv:
+            _, current_avg = get_filtered_sensor_data(client, db_num)
+            print("\n[IV_SCAN] Running final IV scan (iteration_4) after thermal cycling completes...")
+            run_automatic_iv_scan(args.mmts_gui_path, args.mmts_gui_port, batch_name, 'iteration_4', current_avg)
+
         shutdown_system(client, db_num)
 
     except SafetyAbort as e:
         print(f"\n[ABORTED ON SAFETY INTERLOCK] {e}")
+    except CondensationRisk as e:
+        print(f"\n[UNEXPECTED CONDENSATION HOLD at top level] {e} -- returning to ambient as a precaution.")
     except KeyboardInterrupt:
         print("\n[INTERRUPTED] Returning chiller to ambient...")
     except Exception as e:
