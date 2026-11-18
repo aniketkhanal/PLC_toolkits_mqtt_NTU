@@ -93,6 +93,9 @@ def parse_args():
                               "(the same batch_name the MMTS GUI already logged). If given, this "
                               "script UPDATEs that row's cycle_count as real low points are hit. "
                               "If omitted, cycle counts are not written to the database.")
+    parser.add_argument('--cycles', type=int, default=None,
+                         help="Override experiment.cycles from the config file (e.g. from the "
+                              "GUI's Number of Cycles field). If omitted, uses the config file's value.")
     parser.add_argument('--mmts-gui-path', default=None, help='Path to MultiModuleTeststandUI, needed to trigger IV scans automatically')
     parser.add_argument('--mmts-gui-port', type=int, default=5001, help='Port the Flask GUI is listening on.')
     parser.add_argument('--auto-iv', action='store_true', help='Trigger IV scans automatically instead of waiting or typed "continue".')
@@ -542,6 +545,8 @@ def main():
     exp_cfg = cfg['experiment']
     db_cfg = cfg['database']
     db_num = plc_cfg['db_number']
+    if args.cycles:
+        exp_cfg['cycles'] = args.cycles
     total_cycles = exp_cfg['cycles']
 
     client = create_client(plc_cfg)
@@ -575,7 +580,9 @@ def main():
 
     # A fresh run (no resume, or resume declined) links to the batch_name the
     # MMTS GUI already logged for this job, if one was given via --batch.
-    if batch_name is None:
+    # A resumed checkpoint can carry batch_name='' (not None) from a prior run
+    # that itself started with no --batch -- treat that the same as missing.
+    if not batch_name:
         batch_name = args.batch
         completed_cycles = 0
 
