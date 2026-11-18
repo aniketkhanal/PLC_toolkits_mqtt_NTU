@@ -3,13 +3,11 @@ import json
 import threading
 import queue
 import time
-import getpass
 import schedule
 import pytz
-import configparser
 from datetime import datetime
 import yaml
-import os 
+import os
 import sys
 
 # import mqtt modules
@@ -19,21 +17,21 @@ import paho.mqtt.client as mqtt
 import psycopg2
 import psycopg2.pool
 
-#import siemens plc modules
+# import siemens plc modules
 import snap7
 from snap7.type import Areas
 
-# from plc_io import read_sensor_real, create_client
 
 """
 Setting basic information
 """
+
 # Loading yaml configuration file
-def load_config(config_path:str)->None:
+def load_config(config_path: str):
     if not os.path.exists(config_path):
         print(f"Error, there is no configuration file: '{config_path}'")
         sys.exit(1)
-    
+
     with open(config_path, 'r', encoding='utf-8') as f:
         try:
             return yaml.safe_load(f)
@@ -41,7 +39,8 @@ def load_config(config_path:str)->None:
             print(f"Error: {exc}")
             sys.exit(1)
 
-config_path = 'HMI_Control.yml'
+
+config_path = 'HMI_Control.local.yml'
 config = load_config(config_path)
 
 # Database info
@@ -56,22 +55,40 @@ MQTT_BROKER = config['mqtt']['MQTT_BROKER']
 MQTT_PORT = config['mqtt']['MQTT_PORT']
 MQTT_TOPIC = config['mqtt']['MQTT_TOPIC']
 
-#PLC info
+# PLC info
 PLC_IP = config['plc']['ip']
 PLC_RACK = config['plc']['rack']
 PLC_SLOT = config['plc']['slot']
 DB_NUMBER = config['plc']['db_number']
 
+# Institution info
+INSTITUTION = config.get('institution_abbr', 'Unknown')
+# -- Set time_zone --
+INSTITUTION_TIMEZONES = {
+    "CMU": "America/New_York",
+    "IHEP": "Asia/Shanghai",
+    "NTU": "Asia/Taipei",
+    "TTU": "America/Chicago",
+    "TIFR": "Asia/Kolkata",
+    "UCSB": "America/Los_Angeles"
+}
+TIME_ZONE = INSTITUTION_TIMEZONES[INSTITUTION]
+
+
 # Vaisala dew point sensor scale factor
-def act_dew_point(T_plc:float)->float:
+def act_dew_point(T_plc: float) -> float:
     """
-    The scalar factor is needed because of a bug in the PLC programming. 
-    In the PLC analogue module, they are programmed to measure the dew point with a current range of 0 mA to 20 mA; 
-    however, the Vaisala dew point sensor measures the dew point with a current range of 4 mA to 20 mA. 
-    This PLC bug results in inaccurate readings, so we need to account for this when calculating the true dew point.
+    The scalar factor is needed because of a bug in the PLC programming.
+
+    In the PLC analogue module, they are programmed to measure the dew point
+    with a current range of 0 mA to 20 mA; however, the Vaisala dew point
+    sensor measures the dew point with a current range of 4 mA to 20 mA.
+    This PLC bug results in inaccurate readings, so we need to account for
+    this when calculating the true dew point.
     """
-    T_real = 1.25 * T_plc - 5
-    return T_real
+    # T_real = 1.25 * T_plc - 5
+    return T_plc
+
 
 # Sensor id information
 sensor_id_list = [
@@ -98,161 +115,397 @@ workers = []
 # Set up a queue for the database connection
 msg_queue = queue.Queue()
 
-# Global PLC client and prcessing lock
+# Global PLC client and processing lock
 plc_client = None
 plc_lock = threading.Lock()
+
+# Global DB pool
+db_pool = None
+
+# Store previous sensor input state.
+last_seen_data = None
+last_seen_signature = None
+last_seen_lock = threading.Lock()
+
 
 # Set up threaded operation
 def run_threaded(job_func):
     job_thread = threading.Thread(target=job_func)
     job_thread.start()
 
+
 """
 set up PLC connection
 """
+
+# snap7 socket timeouts (ms): a half-open PLC socket fails fast instead of
+# blocking a scheduled read forever (this is what let stalls pile up).
+PLC_RECV_TIMEOUT_MS = 3000
+PLC_SEND_TIMEOUT_MS = 3000
+
+def _configure_plc_timeouts(client):
+    try:
+        from snap7.type import Parameter
+        client.set_param(Parameter.RecvTimeout, PLC_RECV_TIMEOUT_MS)
+        client.set_param(Parameter.SendTimeout, PLC_SEND_TIMEOUT_MS)
+    except Exception as e:
+        # non-fatal: reconnect logic still protects us if timeouts can't be set
+        print(f"Warning: could not set snap7 timeouts: {e}")
+
 def init_plc():
+    """Initial connect (called once at startup). Must NOT be fatal on failure —
+    the read layer will keep retrying/reconnecting."""
     global plc_client
     client = snap7.client.Client()
+    _configure_plc_timeouts(client)
+    try:
+        client.connect(PLC_IP, PLC_RACK, PLC_SLOT)
+        plc_client = client
+        print("PLC connection established")
+    except Exception as e:
+        plc_client = None
+        print(f"Initial PLC connect failed (will retry on first read): {e}")
+
+def _reconnect_plc_locked():
+    """Rebuild the PLC client. MUST be called while holding plc_lock."""
+    global plc_client
+    if plc_client is not None:
+        try:
+            plc_client.disconnect()
+        except Exception:
+            pass
+    client = snap7.client.Client()
+    _configure_plc_timeouts(client)
     client.connect(PLC_IP, PLC_RACK, PLC_SLOT)
     plc_client = client
-    print("PLC connection established")
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - PLC reconnected")
 
-def on_connect(client, userdata, flags, rc, properties):
-    # print(f"Connected with result code {rc}")
+"""
+MQTT callback functions
+"""
+
+def on_connect(client, userdata, flags, rc, properties=None):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Connected with result code {rc}")
     client.subscribe(MQTT_TOPIC, qos=1)
+
 
 def on_message(client, userdata, msg):
     try:
         msg_queue.put(msg.payload.decode("utf-8"))
         print(f"Received message: {msg.payload}")
     except Exception as e:
-        print(f"Error occured: {e}")
+        print(f"Error occurred in on_message: {e}")
 
-def on_disconnect(client, userdata, flags, rc, properties):
+
+def on_disconnect(client, userdata, flags, rc, properties=None):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Disconnected with result code {rc}")
+
 
 def on_log(client, userdata, level, buf):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - MQTT Log: {buf}")
 
+
 """
 set up mqtt server connection
 """
+
 # Publish the data to the MQTT broker
 def publish_mqtt_batch(data):
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+
     try:
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        # payload = json.dumps({"sensor_id": sensor_id, "temperature": temperature})
+
         payload = json.dumps(data)
         client.publish(MQTT_TOPIC, payload, qos=1)
-        print(f"Published playload to MQTT: {payload}")
+
+        print(f"Published payload to MQTT: {payload}")
+
     except Exception as e:
         print(f"Cannot publish data to MQTT: {e}")
+
     finally:
         client.disconnect()
-        
+
+
 """
 setting database
 """
+
 def db_pool_setting():
-    # Set up PostgresSQL connection pool
     global db_pool
+
     try:
         db_pool = psycopg2.pool.SimpleConnectionPool(
-            1, 20, # Min and max connections
+            1,
+            20,
             user=DB_USER,
             password=DB_PASSWORD,
             host=DB_HOST,
             port=DB_PORT,
-            database=DB_NAME
+            database=DB_NAME,
+            connect_timeout=10
         )
+
         if db_pool:
-            print("PostgresSQL connection pool created")
+            print("PostgreSQL connection pool created")
+
     except Exception as e:
-        print(f"Cannot create PostgresSQL connection pool: {e}")
+        print(f"Cannot create PostgreSQL connection pool: {e}")
+        sys.exit(1)
 
     return db_pool
+
+
+"""
+Duplicate / state-change checking helper
+"""
+
+def make_data_signature(data):
+    """
+    Create a comparable signature from sensor values only.
+
+    `log_timestamp` is excluded because it changes every time,
+    even when all sensor readings are physically the same.
+
+    The signature includes:
+    - device name
+    - value
+    - metric
+
+    Float values are rounded to avoid tiny PLC floating-point noise.
+    """
+
+    signature = {}
+
+    for sensor_id in sensor_id_list:
+        value = data[sensor_id][0]
+        metric = data[sensor_id][1]
+
+        if isinstance(value, float):
+            value = round(value, 2)
+
+        signature[sensor_id] = [value, metric]
+
+    return signature
+
+
+def insert_sensor_data_to_db(data, worker_id, reason=""):
+    """
+    Insert one full sensor payload into the database.
+
+    One payload contains multiple sensors, so this function inserts
+    one row per sensor_id.
+    """
+
+    conn = None
+    cursor = None
+    ok = False
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+
+        time_str = data['measured_at']
+
+        # setup the timezone:
+        timezone = pytz.timezone(TIME_ZONE)
+        naive_time = datetime.fromisoformat(time_str)
+        local_time = timezone.localize(naive_time)
+
+        # formate the time to UTC timezone before inserting into database
+        utc_time = local_time.astimezone(pytz.utc)
+
+        insert_sql = """
+            INSERT INTO mmts_sensors_logging
+                (device_name, metric, value, log_timestamp, timestamp_utc)
+            VALUES
+                (%s, %s, %s, %s, %s)
+        """
+
+        for sensor_id in sensor_id_list:
+            cursor.execute(
+                insert_sql,
+                (
+                    sensor_id,
+                    data[sensor_id][1],
+                    data[sensor_id][0],
+                    local_time,
+                    utc_time
+                )
+            )
+
+        conn.commit()
+        ok = True
+        print(f"Worker {worker_id}: inserted sensor data {reason}")
+
+    except Exception as e:
+        print(f"Worker {worker_id} database insert error: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            db_pool.putconn(conn, close=not ok)   # discard the conn if the insert failed
+
 
 """
 Database write worker thread, retrieves messages from the queue and writes to PostgreSQL.
 """
+
 def db_worker(worker_id):
-    taipei_tz = pytz.timezone('Asia/Taipei')
+    global last_seen_data
+    global last_seen_signature
+
     while True:
-        msg_playload = msg_queue.get()
-        if msg_playload is None:
+        msg_payload = msg_queue.get()
+
+        if msg_payload is None:
             print(f"Worker {worker_id} stopping")
             msg_queue.task_done()
-            break # Stop the thread
-        try:
-            # get a connection from the pool
-            conn = db_pool.getconn()
-            cursor = conn.cursor()
-            data = json.loads(msg_playload)
+            break
 
-            time_str = data['measured_at']
-            local_time = datetime.fromisoformat(time_str) # fromisoformat() 函式，它能自動解析 ISO 8601 時間格式
-            utc_time = local_time.astimezone(pytz.utc)
-   
-            insert_sql = "INSERT INTO measurement (sensor_id, metric, value, measured_at) VALUES (%s, %s, %s, %s)"       
-            for sensor_id in sensor_id_list:
-                cursor.execute(insert_sql, (sensor_id, data[sensor_id][1], data[sensor_id][0], utc_time))
-            conn.commit()   
-            cursor.close()
-            db_pool.putconn(conn)
-            # print(f"Woker {worker_id} inserted data to the database: {data}")
+        try:
+            data = json.loads(msg_payload)
+            current_signature = make_data_signature(data)
+
+            # This list stores the data payloads that should be inserted.
+            # We collect them inside the lock, then insert outside the lock.
+            data_to_insert_list = []
+
+            with last_seen_lock:
+                # first input:
+                if last_seen_signature is None:
+                    data_to_insert_list.append(
+                        (data, "because this is the first input")
+                    )
+
+                    last_seen_signature = current_signature
+                    last_seen_data = data
+
+                    print(f"Worker {worker_id}: first input, will insert current data")
+
+                # same input as previous one, no state change:
+                elif current_signature == last_seen_signature:
+                    last_seen_data = data
+
+                    print(
+                        f"Worker {worker_id}: same input as previous one, "
+                        f"skip insert but update latest cached data"
+                    )
+
+                # input changes:
+                else:
+                    data_to_insert_list.append(
+                        (data, "due to the changes")
+                    )
+
+                    last_seen_signature = current_signature
+                    last_seen_data = data
+
+                    print(
+                        f"Worker {worker_id}: input changed, "
+                        f"will insert previous latest data and current data"
+                    )
+
+            # Insert outside the lock so database insert does not block
+            # other workers from checking incoming data.
+            print(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>", data_to_insert_list)
+            for insert_data, reason in data_to_insert_list:
+                insert_sensor_data_to_db(insert_data, worker_id, reason)
+
         except Exception as e:
-            print(f"woker {worker_id} error: {e}")
+            print(f"Worker {worker_id} error: {e}")
+
         finally:
             msg_queue.task_done()
 
+
 def workers_setting():
     for i in range(num_workers):
-        t = threading.Thread(target=db_worker, args=(i+1,), daemon=True)
+        t = threading.Thread(target=db_worker, args=(i + 1,), daemon=True)
         t.start()
         workers.append(t)
 
+
 """
-PLC works functions
+PLC work functions
 """
-    
-# Get the data from the PLC
-def read_sensor_real(offset):
+
+def _plc_read(read_fn):
+    """
+    Execute a snap7 read under plc_lock, with reconnect + one retry.
+    On ANY read exception (the real signal of a dropped/half-open link),
+    drop the client and reconnect on the next attempt. Raises if it still
+    fails after the retry (caller = schedule_job logs & skips that tick).
+    """
+    global plc_client
     with plc_lock:
-        data = plc_client.db_read(DB_NUMBER, offset, 4)
+        last_err = None
+        for attempt in (1, 2):
+            try:
+                if plc_client is None or not plc_client.get_connected():
+                    _reconnect_plc_locked()
+                return read_fn(plc_client)
+            except Exception as e:
+                last_err = e
+                print(f"{time.strftime('%H:%M:%S')} - PLC read error "
+                      f"(attempt {attempt}/2): {e}")
+                try:
+                    if plc_client is not None:
+                        plc_client.disconnect()
+                except Exception:
+                    pass
+                plc_client = None      # force reconnect next attempt
+                time.sleep(0.5)
+        raise last_err
+
+
+def read_sensor_real(offset):
+    data = _plc_read(lambda c: c.db_read(DB_NUMBER, offset, 4))
     return snap7.util.get_real(data, 0)
 
-def read_sensor_bool(byte_offset, bit_index):
-    with plc_lock:
-        data = plc_client.db_read(DB_NUMBER, byte_offset, 1)
-        return snap7.util.get_bool(data, 0, bit_index)
 
-def read_m_bool(byte_offset, bit_index):
-    with plc_lock:
-        data = plc_client.read_area(Areas.MK, 0, byte_offset, 1)
+def read_sensor_bool(byte_offset, bit_index):
+    data = _plc_read(lambda c: c.db_read(DB_NUMBER, byte_offset, 1))
     return snap7.util.get_bool(data, 0, bit_index)
 
-def system_status()->list:
-    '''
-    Reading the current operational status of the chiller. 
+
+def read_m_bool(byte_offset, bit_index):
+    data = _plc_read(lambda c: c.read_area(Areas.MK, 0, byte_offset, 1))
+    return snap7.util.get_bool(data, 0, bit_index)
+
+def system_status() -> list:
+    """
+    Reading the current operational status of the chiller.
+
     The function will send out an integer to represent the operation status:
-    1. Standby 
-    2. Countdown - Warming Stage 
-    3. Warming Up 
-    4. Countdown - Cooling Stage 
-    5. Cooling Down.
-    '''
+
+    0. Door open / system check needed
+    1. Standby
+    2. Countdown - Warming Stage
+    3. Warming Up
+    4. Countdown - Cooling Stage
+    5. Cooling Down
+    """
+
     status_code = 0
+
     status_dict = {
         0: 'The door is open. Please check the system.',
-        1: 'Statndby',
-        2: 'Countdown-Warming Stage ',
+        1: 'Standby',
+        2: 'Countdown-Warming Stage',
         3: 'Warming up',
-        4: 'Countdown-Cooling Stage ',
+        4: 'Countdown-Cooling Stage',
         5: 'Cooling down'
     }
-    result = []
 
     idle_running = read_sensor_bool(540, 0)
     is_go_cold = read_m_bool(100, 4)
@@ -261,8 +514,7 @@ def system_status()->list:
 
     if not is_door_lock:
         status_code = 0
-        result = [status_code, status_dict[status_code]]
-        return result
+        return [status_code, status_dict[status_code]]
 
     if idle_running:
         if is_go_warm:
@@ -278,10 +530,9 @@ def system_status()->list:
             status_code = 5
         else:
             status_code = 1
-    
-    result = [status_code, status_dict[status_code]]
-    return result
-    
+
+    return [status_code, status_dict[status_code]]
+
 
 def schedule_job():
     try:
@@ -295,13 +546,9 @@ def schedule_job():
         rtd07 = read_sensor_real(234)
         rtd08 = read_sensor_real(272)
 
-
         # dew point
         dmt01 = act_dew_point(read_sensor_real(314))
         dmt02 = act_dew_point(read_sensor_real(356))
-        # dmt01 = read_sensor_real(314)
-        # dmt02 = read_sensor_real(356)
-
 
         # chiller temp
         chiller01 = read_sensor_real(410)
@@ -310,7 +557,6 @@ def schedule_job():
 
         # system status
         sys_status = system_status()[0]
-        
 
         # Combine the data into a single payload
         data = {
@@ -324,22 +570,23 @@ def schedule_job():
             "RTD-08": [rtd08, 'temperature_C'],
             "DMT-01": [dmt01, 'dewpoint_C'],
             "DMT-02": [dmt02, 'dewpoint_C'],
-            "Chiller-01":[chiller01, 'temperature_C'],
+            "Chiller-01": [chiller01, 'temperature_C'],
             "Chiller-T": [chiller02, 'temperature_C'],
             "Chiller-PrevT": [chiller03, 'temperature_C'],
             "System Status": [sys_status, 'system_C'],
             "measured_at": time.strftime("%Y-%m-%d %H:%M:%S")
         }
+
         publish_mqtt_batch(data)
+
     except Exception as e:
         print(f"Error reading PLC data: {e}")
 
-def main():
 
-    # set up db pools and workers
+def main():
+    # Set up DB pool and workers
     db_pool_setting()
     workers_setting()
-    
 
     # Schedule the job with 20 seconds interval
     schedule.every().minute.at(":00").do(run_threaded, schedule_job)
@@ -356,7 +603,7 @@ def main():
     # Connect to the MQTT broker
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
     client.loop_start()
-    
+
     # Establish connection to the PLC
     init_plc()
 
@@ -365,18 +612,26 @@ def main():
             schedule.run_pending()
             time.sleep(10)
             print(f"Queue size: {msg_queue.qsize()}")
+
     except KeyboardInterrupt:
-        print("Exiting")        
-    except Exception as e:  
-        print(f"Error occured: {e}")
+        print("Exiting")
+
+    except Exception as e:
+        print(f"Error occurred: {e}")
 
     finally:
         client.loop_stop()
+
         for _ in range(num_workers):
             msg_queue.put(None)
+
         for worker in workers:
-            worker.join() # Wait for the worker threads to finish
-        # msg_queue.put(None) # Stop the worker thread
+            worker.join()
+
+        if db_pool:
+            db_pool.closeall()
+            print("PostgreSQL connection pool closed")
+
 
 if __name__ == "__main__":
     main()
